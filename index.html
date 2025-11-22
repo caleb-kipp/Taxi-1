@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Motorbike Taxi — Demo</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root{--accent:#0b74de;--muted:#6b7280}
+    html,body,#app{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Arial}
+    #map{height:62vh}
+    .app-wrap{display:flex;flex-direction:column;height:100%}
+    .topbar{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+    .controls{padding:12px;display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+    .card{background:#fff;padding:12px;border-radius:10px;box-shadow:0 6px 18px rgba(15,23,42,.06)}
+    input,select,button{padding:10px;border-radius:8px;border:1px solid #e5e7eb}
+    .driver-list{max-height:220px;overflow:auto;margin-top:8px}
+    .driver-item{display:flex;align-items:center;gap:10px;padding:8px;border-radius:8px;border:1px dashed #eef2f7;margin-bottom:8px}
+    .badge{background:var(--accent);color:#fff;padding:6px 8px;border-radius:999px;font-weight:600}
+    .muted{color:var(--muted);font-size:13px}
+    .footer{padding:12px;background:#f8fafc;display:flex;gap:8px;align-items:center}
+    .estimate{font-weight:700}
+    .mapbox-attribution{display:none}
+  </style>
+</head>
+<body>
+  <div id="app" class="app-wrap">
+    <div class="topbar">
+      <div style="display:flex;gap:12px;align-items:center">
+        <h3 style="margin:0">MotoTaxi Demo</h3>
+        <div class="muted">Pilot-ready UI • Leaflet OSM</div>
+      </div>
+      <div>
+        <button id="locmeBtn">📍 Use my location</button>
+      </div>
+    </div>
+
+    <div id="map"></div>
+
+    <div style="padding:12px">
+      <div class="controls">
+        <div class="card">
+          <div style="display:flex;gap:8px;align-items:center">
+            <input id="pickup" placeholder="Pickup (auto or type)" />
+            <input id="dest" placeholder="Destination (type a name)" />
+            <select id="rideType"><option value="moto">Bike‑Taxi (Moto)</option><option value="cargo">Cargo</option></select>
+            <button id="findDrivers">Find Nearby Drivers</button>
+          </div>
+
+          <div class="driver-list" id="driverList"></div>
+        </div>
+        <div class="card">
+          <div><strong>Estimate</strong></div>
+          <div class="muted">Distance, time & price (fuel+pay+profit)</div>
+          <div style="margin-top:8px">Distance: <span id="estDist">—</span> km</div>
+          <div>Duration: <span id="estDur">—</span> min</div>
+          <div>Fuel: <span id="estFuel">—</span> L</div>
+          <div class="estimate">Estimated Fare: <span id="estFare">—</span></div>
+          <div style="margin-top:10px"><button id="requestRide" class="badge">Request Selected Driver</button></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div class="muted">Selected Driver:</div>
+      <div id="selectedDriver">None</div>
+      <div style="margin-left:auto">Status: <span id="status">idle</span></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    // Basic frontend logic: geolocation, list drivers, estimate fare using local estimator.
+
+    const server = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+      ? 'http://localhost:3000' : location.origin;
+
+    let map = L.map('map', {zoomControl:true}).setView([1.286389,36.817223], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {maxZoom:19}).addTo(map);
+    let pickupMarker, destMarker;
+    let driverMarkers = [];
+    let selectedDriver = null;
+
+    function setStatus(s){document.getElementById('status').innerText=s}
+
+    async function reverseGeocode(lat,lng){
+      // very lightweight nominatim call (no key) — fallback to coords if blocked
+      try{
+        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}`);
+        const j = await res.json();
+        return j.display_name || `${lat.toFixed(5)},${lng.toFixed(5)}`;
+      }catch(e){return `${lat.toFixed(5)},${lng.toFixed(5)}`}
+    }
+
+    async function geocodeSearch(q){
+      try{
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&q=${encodeURIComponent(q)}`);
+        const arr = await res.json();
+        return arr; // array of {lat,lon,display_name}
+      }catch(e){return []}
+    }
+
+    document.getElementById('locmeBtn').addEventListener('click',async()=>{
+      if(navigator.geolocation){
+        setStatus('locating');
+        navigator.geolocation.getCurrentPosition(async(pos)=>{
+          const lat=pos.coords.latitude, lng=pos.coords.longitude;
+          map.setView([lat,lng],15);
+          if(pickupMarker) map.removeLayer(pickupMarker);
+          pickupMarker = L.marker([lat,lng]).addTo(map).bindPopup('You (auto pickup)').openPopup();
+          document.getElementById('pickup').value = await reverseGeocode(lat,lng);
+          pickupMarker._coords = [lat,lng];
+          setStatus('ready');
+        },(err)=>{alert('Location denied or error'); setStatus('error')});
+      }else alert('Geolocation not supported');
+    });
+
+    document.getElementById('dest').addEventListener('input',async(e)=>{
+      const q = e.target.value;
+      if(q.length<3) return;
+      const results = await geocodeSearch(q+ ' Nairobi');
+      // Show the top 5 suggestions via simple dropdown (browser default datalist would be nicer)
+      // For brevity, auto‑select first match
+      if(results && results.length){
+        const lat=parseFloat(results[0].lat), lng=parseFloat(results[0].lon);
+        if(destMarker) map.removeLayer(destMarker);
+        destMarker = L.marker([lat,lng], {icon:L.divIcon({className:'muted',html:'📍'})}).addTo(map).bindPopup(results[0].display_name).openPopup();
+        document.getElementById('dest').dataset.lat=lat; document.getElementById('dest').dataset.lng=lng;
+      }
+    });
+
+    document.getElementById('findDrivers').addEventListener('click', async()=>{
+      setStatus('finding drivers');
+      // attempt to get pickup coords from pickupMarker or input
+      let pickupCoords;
+      if(pickupMarker) pickupCoords = pickupMarker._coords;
+      else if(document.getElementById('pickup').value){
+        // try geocode
+        const r = await geocodeSearch(document.getElementById('pickup').value);
+        if(r && r[0]) pickupCoords = [parseFloat(r[0].lat), parseFloat(r[0].lon)];
+      }
+      if(!pickupCoords){alert('Please set pickup location (use my location or type a pickup)'); setStatus('idle'); return}
+
+      // call backend to get nearby drivers (mocked)
+      const resp = await fetch(server + '/api/drivers?lat='+pickupCoords[0]+'&lng='+pickupCoords[1]+'&type='+document.getElementById('rideType').value);
+      const data = await resp.json();
+      document.getElementById('driverList').innerHTML='';
+      driverMarkers.forEach(m=>map.removeLayer(m)); driverMarkers=[];
+      data.forEach(d=>{
+        const item = document.createElement('div'); item.className='driver-item';
+        item.innerHTML = `<div style="width:48px;height:48px;border-radius:24px;background:#eef;display:flex;align-items:center;justify-content:center">🏍️</div>
+          <div style="flex:1"><div><strong>${d.name}</strong> <span class="muted">(${d.rating.toFixed(1)}★)</span></div>
+          <div class="muted">${d.vehicle} • ${d.distance.toFixed(2)} km</div></div>
+          <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+            <div class="badge">${d.eta}m</div>
+            <button data-id="${d.id}" class="selectBtn">Select</button>
+          </div>`;
+        document.getElementById('driverList').appendChild(item);
+
+        const mk = L.marker([d.lat,d.lng]).addTo(map).bindPopup(`<strong>${d.name}</strong><br>${d.vehicle}<br>${d.distance.toFixed(2)} km`).openPopup();
+        mk._driverId=d.id; driverMarkers.push(mk);
+      });
+
+      // wire up select buttons
+      document.querySelectorAll('.selectBtn').forEach(btn=>btn.addEventListener('click', async(ev)=>{
+        const id = ev.target.dataset.id; selectedDriver = data.find(x=>x.id==id);
+        document.getElementById('selectedDriver').innerText = selectedDriver.name + ' • ' + selectedDriver.phone;
+        // calculate estimate
+        const pickup = pickupCoords;
+        const destLat = parseFloat(document.getElementById('dest').dataset.lat||pickup[0]);
+        const destLng = parseFloat(document.getElementById('dest').dataset.lng||pickup[1]);
+        const est = await fetch(server + '/api/estimate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pickup:{lat:pickup[0],lng:pickup[1]},dest:{lat:destLat,lng:destLng},vehicle:'moto'})});
+        const j = await est.json();
+        document.getElementById('estDist').innerText = j.distanceKm.toFixed(2);
+        document.getElementById('estDur').innerText = Math.round(j.durationMin);
+        document.getElementById('estFuel').innerText = j.fuelLiters.toFixed(2);
+        document.getElementById('estFare').innerText = j.fare.toFixed(2) + ' KES';
+        setStatus('driver selected');
+      }));
+
+      setStatus('drivers listed');
+    });
+
+    document.getElementById('requestRide').addEventListener('click', async()=>{
+      if(!selectedDriver){alert('Select a driver first');return}
+      setStatus('requesting');
+      const payload = { rider:{name:'Demo Rider',phone:'+254700000000'}, driverId:selectedDriver.id, pickup:pickupMarker?{lat:pickupMarker._coords[0],lng:pickupMarker._coords[1]}:null, destination:{lat:parseFloat(document.getElementById('dest').dataset.lat||0),lng:parseFloat(document.getElementById('dest').dataset.lng||0)} };
+      const resp = await fetch(server + '/api/request-ride',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+      const j = await resp.json();
+      if(j.success){alert('Ride requested — driver notified (mock)'); setStatus('requested')}else alert('Request failed');
+    });
+
+    // initial demo: ping server
+    (async()=>{try{await fetch(server + '/api/ping');}catch(e){console.warn('Server ping failed',e)}})();
+  </script>
+</body>
+</html>
